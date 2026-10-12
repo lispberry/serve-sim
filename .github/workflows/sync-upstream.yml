@@ -1,0 +1,164 @@
+name: Sync upstream
+
+# Fork-only workflow (lispberry/serve-sim). Merges upstream expo into this
+# fork once a day, keeping the fork's own commits on top. A clean merge is
+# pushed with SYNC_TOKEN, a PAT that may update .github/workflows. A
+# conflicting merge leaves the branch untouched, opens (or comments on) an
+# issue labelled upstream-sync-conflict, and fails the run.
+#
+# Copied from lispberry/t3code; to reuse in another fork, change the env block.
+
+on:
+  schedule:
+    # Daily; avoids minute zero, when GitHub scheduled jobs are busiest.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Branch to merge upstream into (default: expo)"
+        required: false
+        type: string
+
+env:
+  UPSTREAM_REPO: expo/serve-sim
+  UPSTREAM_BRANCH: expo
+  TARGET_BRANCH: ${{ inputs.target_branch || 'expo' }}
+  # Workflows allowed to stay enabled in this fork. Everything else upstream
+  # adds is disabled after each sync (it needs upstream's runners and secrets).
+  WORKFLOW_ALLOWLIST: sync-upstream.yml
+  CONFLICT_LABEL: upstream-sync-conflict
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge
+        id: merge
+        run: |
+          set -uo pipefail
+          upstream_ref="upstream/${UPSTREAM_BRANCH}"
+          if git merge-base --is-ancestor "$upstream_ref" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}."
+            echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "range=$(git merge-base HEAD "$upstream_ref" | cut -c1-12)..$(git rev-parse --short=12 "$upstream_ref")"
+            echo "count=$(git rev-list --count "HEAD..$upstream_ref")"
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit "$upstream_ref"; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push
+        if: steps.merge.outputs.result == 'merged'
+        run: git push origin "HEAD:${TARGET_BRANCH}"
+
+      - name: Close resolved conflict issues
+        if: steps.merge.outputs.result == 'merged' || steps.merge.outputs.result == 'up-to-date'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$CONFLICT_LABEL" --json number --jq '.[].number' |
+            while read -r number; do
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                --comment "Resolved: \`${TARGET_BRANCH}\` is in sync with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+            done
+
+      - name: Report conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RANGE: ${{ steps.merge.outputs.range }}
+          COUNT: ${{ steps.merge.outputs.count }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "Merging ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} into \`${TARGET_BRANCH}\` conflicts. ${COUNT} upstream commits are waiting (\`${RANGE}\`). \`${TARGET_BRANCH}\` was left untouched."
+            echo
+            echo "**Conflicting files**"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "**Resolve locally**"
+            echo
+            echo '```bash'
+            echo "git remote add upstream https://github.com/${UPSTREAM_REPO}.git 2>/dev/null || true"
+            echo "git fetch upstream ${UPSTREAM_BRANCH}"
+            echo "git switch ${TARGET_BRANCH} && git pull"
+            echo "git merge upstream/${UPSTREAM_BRANCH}"
+            echo "# fix conflicts, then: git commit && git push"
+            echo '```'
+            echo
+            echo "Run: ${run_url}"
+          } > "$RUNNER_TEMP/body.md"
+
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$CONFLICT_LABEL" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Upstream sync conflict: ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} → ${TARGET_BRANCH}" \
+              --label "$CONFLICT_LABEL" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+          echo "::error::Upstream merge conflicts in $(wc -l < "$RUNNER_TEMP/conflicts.txt") file(s); see the ${CONFLICT_LABEL} issue."
+          exit 1
+
+      - name: Disable non-fork workflows
+        if: always() && steps.merge.outputs.result != 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | "\(.id) \(.path)"' |
+            while read -r id path; do
+              name="${path##*/}"
+              if [[ " ${WORKFLOW_ALLOWLIST} " != *" ${name} "* ]]; then
+                echo "Disabling ${path}"
+                gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable"
+              fi
+            done
+
+      - name: Summary
+        if: always()
+        env:
+          RESULT: ${{ steps.merge.outputs.result }}
+          RANGE: ${{ steps.merge.outputs.range }}
+          COUNT: ${{ steps.merge.outputs.count }}
+        run: |
+          echo "### Upstream sync: ${RESULT:-failed}" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${RANGE:-}" ]] && echo "${COUNT} commits from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (\`${RANGE}\`) → \`${TARGET_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          true
