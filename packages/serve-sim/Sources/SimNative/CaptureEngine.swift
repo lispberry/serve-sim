@@ -2,6 +2,7 @@ import Foundation
 import CoreVideo
 import CoreMedia
 import os
+import StreamingPolicy
 
 // JPEG and AVCC encode only while their HTTP transports have subscribers.
 // Encoded bytes are handed to the node-swift binding, which marshals them onto
@@ -66,6 +67,94 @@ actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
     }
 
     deinit { continuation.finish() }
+}
+
+/// An AVCC subscriber that keeps up to `depth` frames inside VideoToolbox at once.
+///
+/// Waiting for each sample before submitting the next frame bounds throughput by encode
+/// latency, which runs 10-25 ms at simulator resolution and dropped a 60 Hz stream to
+/// ~45 fps. Overlapping submissions bounds it by encoder throughput instead; two slots
+/// still lost frames whenever latency spiked, three kept up. Frames are
+/// submitted and delivered in capture order, and each sample is delivered as soon as it
+/// and every earlier one are ready.
+actor PipelinedAVCCConsumer: CaptureConsuming {
+    nonisolated let continuation: AsyncStream<Frame>.Continuation
+
+    init(
+        encoder: AVCCEncoder,
+        depth: Int = 3,
+        onFrame: @escaping @isolated(any) (H264Encoder.Encoded?) async -> Void
+    ) {
+        let (frames, continuation) = AsyncStream.makeStream(
+            of: Frame.self,
+            // drop old frames if there's backpressure
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let (submitted, submittedContinuation) = AsyncStream.makeStream(of: H264Encoder.Pending.self)
+        let slots = EncodeSlots(depth)
+        self.continuation = continuation
+        Task {
+            var iterator = frames.makeAsyncIterator()
+            // Take a slot before the frame, so the frame submitted is the newest one.
+            while true {
+                await slots.acquire()
+                guard let frame = await iterator.next() else { break }
+                do {
+                    if let pending = try await encoder.submit(frame) {
+                        submittedContinuation.yield(pending)
+                        continue
+                    }
+                } catch {
+                    streamDiagnosticLog("[stream] frame encode failed: \(error)")
+                }
+                await slots.release()
+            }
+            submittedContinuation.finish()
+        }
+        Task {
+            _ = onFrame.isolation
+            for await pending in submitted {
+                do {
+                    await onFrame(try await encoder.finish(pending))
+                } catch {
+                    streamDiagnosticLog("[stream] frame encode failed: \(error)")
+                }
+                await slots.release()
+            }
+        }
+    }
+
+    nonisolated func handleFrame(_ frame: Frame) {
+        continuation.yield(frame)
+    }
+
+    deinit { continuation.finish() }
+}
+
+/// A counting semaphore for the frames a pipelined consumer may have in flight.
+private actor EncodeSlots {
+    private var free: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(_ count: Int) {
+        free = max(1, count)
+    }
+
+    func acquire() async {
+        if free > 0 {
+            free -= 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            free += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
 }
 
 actor CaptureEngine {
@@ -153,6 +242,19 @@ actor CaptureEngine {
         return { await self.removeConsumer(id) }
     }
 
+    private func addPipelinedConsumer(
+        id: UUID,
+        encoder: AVCCEncoder,
+        onFrame: sending @escaping @isolated(any) (H264Encoder.Encoded?) async -> Void
+    ) -> (@Sendable () async -> Void) {
+        let consumer = PipelinedAVCCConsumer(encoder: encoder) { [weak self] encoded in
+            guard let self, await self.phase == .running else { return }
+            await onFrame(encoded)
+        }
+        consumers[id] = consumer
+        return { await self.removeConsumer(id) }
+    }
+
     private func removeConsumer(
         _ id: UUID
     ) {
@@ -187,7 +289,7 @@ actor CaptureEngine {
         )
         avccEncoders[id] = encoder
         streamDiagnosticLog("[stream:avcc] subscriber added count=\(avccEncoders.count)")
-        _ = addConsumer(id: id, encoder: encoder) { [weak self] encoded in
+        _ = addPipelinedConsumer(id: id, encoder: encoder) { [weak self] encoded in
             let flagDescription: Int32 = 1 << 0
             let flagKeyframe: Int32 = 1 << 1
 
@@ -396,7 +498,7 @@ actor MJPEGEncoder: FrameEncoder {
             let data = try await inFlight.task.value
             return settingsGeneration == inFlight.generation ? data : nil
         }
-        guard frameRateGate.shouldEncode() else { return nil }
+        guard frameRateGate.shouldEncode(atNanoseconds: DispatchTime.now().uptimeNanoseconds) else { return nil }
         guard let pixelBuffer = scaler.scale(frame.pixelBuffer, maxDimension: maxDimension) else {
             return nil
         }
@@ -441,16 +543,23 @@ actor AVCCEncoder: FrameEncoder {
     }
 
     func encode(_ frame: Frame) async throws -> H264Encoder.Encoded? {
-        guard frameRateGate.shouldEncode() else { return nil }
+        guard let pending = try await submit(frame) else { return nil }
+        return try await finish(pending)
+    }
+
+    /// Hand a frame to VideoToolbox, or return nil when the frame-rate cap skips it.
+    func submit(_ frame: Frame) async throws -> H264Encoder.Pending? {
+        guard frameRateGate.shouldEncode(atNanoseconds: DispatchTime.now().uptimeNanoseconds) else { return nil }
         guard let pixelBuffer = scaler.scale(frame.pixelBuffer, maxDimension: maxDimension) else {
             return nil
         }
-        let result = try await h264Encoder.encode(
-            pixelBuffer,
-            forceKeyframe: forceKeyframe,
-        )
+        let pending = try await h264Encoder.submit(pixelBuffer, forceKeyframe: forceKeyframe)
         forceKeyframe = false
-        return result
+        return pending
+    }
+
+    func finish(_ pending: H264Encoder.Pending) async throws -> H264Encoder.Encoded {
+        try await h264Encoder.finish(pending)
     }
 
     func update(fps: Int, bitrate: Int, maxDimension: Int) async {

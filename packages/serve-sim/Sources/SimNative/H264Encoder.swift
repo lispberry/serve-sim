@@ -6,9 +6,12 @@ import VideoToolbox
 /// Real-time H.264 encoder backed by `VTCompressionSession`, producing AVCC
 /// (length-prefixed NAL) output for the `/stream.avcc` endpoint.
 ///
-/// Encoding suspends until VideoToolbox returns a sample. FrameCapture owns the
-/// IOSurface snapshot, while CaptureConsumer bounds each subscriber to the
-/// newest pending frame so a slow encoder cannot stall capture or other viewers.
+/// `submit` hands a frame to VideoToolbox and returns at once; `finish` waits for
+/// that frame's sample. Splitting the two lets a consumer keep more than one frame
+/// in the encoder, so throughput is not bounded by per-frame encode latency.
+/// Submit and finish frames in the same order. FrameCapture owns the IOSurface
+/// snapshot, while the consumers bound each subscriber to the newest pending frame
+/// so a slow encoder cannot stall capture or other viewers.
 actor H264Encoder {
     private static let encodeTimeout = DispatchTimeInterval.milliseconds(500)
 
@@ -33,7 +36,7 @@ actor H264Encoder {
     private var frameCount: Int64 = 0
     private var lowLatencyEnabled = true
     private var forceKeyframeAfterReset = false
-    private var encodeInFlight = false
+    private var encodesInFlight = 0
     private var pendingSettings: (fps: Int32, bitrate: Int)?
 
     init(fps: Int = 60, bitrate: Int = 6_000_000) {
@@ -45,8 +48,21 @@ actor H264Encoder {
         if let session { VTCompressionSessionInvalidate(session) }
     }
 
+    /// A frame inside VideoToolbox, redeemed with `finish`.
+    struct Pending: @unchecked Sendable {
+        fileprivate let completion: EncodeCompletion
+        fileprivate let session: VTCompressionSession
+        fileprivate let source: CVPixelBuffer
+        fileprivate let presentationTimeStamp: CMTime
+    }
+
     /// Submit one frame and resume when VideoToolbox returns its sample.
     func encode(_ source: CVPixelBuffer, forceKeyframe: Bool = false) async throws -> Encoded {
+        try await finish(submit(source, forceKeyframe: forceKeyframe))
+    }
+
+    /// Hand one frame to VideoToolbox without waiting for its sample.
+    func submit(_ source: CVPixelBuffer, forceKeyframe: Bool = false) throws -> Pending {
         let w = Int32(CVPixelBufferGetWidth(source))
         let h = Int32(CVPixelBufferGetHeight(source))
         if session == nil || w != width || h != height {
@@ -57,13 +73,6 @@ actor H264Encoder {
         guard let session else {
             throw Errors.couldNotCreateSession
         }
-        encodeInFlight = true
-        defer {
-            encodeInFlight = false
-            if let pendingSettings {
-                applySettings(fps: pendingSettings.fps, bitrate: pendingSettings.bitrate)
-            }
-        }
 
         frameCount += 1
         let pts = CMTime(value: frameCount, timescale: fps)
@@ -73,14 +82,34 @@ actor H264Encoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as NSDictionary
             : nil
 
-        if let buffer = await encodeFrame(
-            source,
+        encodesInFlight += 1
+        return Pending(
+            completion: submitFrame(
+                source,
+                session: session,
+                presentationTimeStamp: pts,
+                frameProperties: frameProps
+            ),
             session: session,
-            presentationTimeStamp: pts,
-            frameProperties: frameProps
-        ) {
+            source: source,
+            presentationTimeStamp: pts
+        )
+    }
+
+    /// Wait for a submitted frame's sample.
+    func finish(_ pending: Pending) async throws -> Encoded {
+        defer {
+            encodesInFlight -= 1
+            if encodesInFlight == 0, let pendingSettings {
+                applySettings(fps: pendingSettings.fps, bitrate: pendingSettings.bitrate)
+            }
+        }
+        if let buffer = await pending.completion.value() {
             return try extract(from: buffer)
         }
+        // A frame still inside a session that has since been replaced (resize or new
+        // settings) fails for that reason alone; it says nothing about rate control.
+        guard pending.session === session else { throw Errors.encodingFailed }
 
         guard lowLatencyEnabled else {
             forceKeyframeAfterReset = true
@@ -97,59 +126,58 @@ actor H264Encoder {
         let retryProperties = [
             kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!,
         ] as NSDictionary
-        guard let buffer = await encodeFrame(
-            source,
+        guard let buffer = await submitFrame(
+            pending.source,
             session: fallbackSession,
-            presentationTimeStamp: pts,
+            presentationTimeStamp: pending.presentationTimeStamp,
             frameProperties: retryProperties
-        ) else {
+        ).value() else {
             throw Errors.encodingFailed
         }
         forceKeyframeAfterReset = false
         return try extract(from: buffer)
     }
 
-    private func encodeFrame(
+    private func submitFrame(
         _ source: CVPixelBuffer,
         session: VTCompressionSession,
         presentationTimeStamp: CMTime,
         frameProperties: NSDictionary?
-    ) async -> CMSampleBuffer? {
-        await withCheckedContinuation { continuation in
-            let completion = EncodeCompletion(continuation)
-            let timeout = DispatchWorkItem {
-                streamDiagnosticLog("[stream:h264] encode timed out")
-                completion.resume(returning: nil)
-            }
-            completion.setTimeout(timeout)
-            DispatchQueue.global(qos: .userInteractive).asyncAfter(
-                deadline: .now() + Self.encodeTimeout,
-                execute: timeout
-            )
-            let status = VTCompressionSessionEncodeFrame(
-                session,
-                imageBuffer: source,
-                presentationTimeStamp: presentationTimeStamp,
-                duration: .invalid,
-                frameProperties: frameProperties,
-                infoFlagsOut: nil
-            ) { @Sendable status, _, sampleBuffer in
-                guard status == noErr, let sb = sampleBuffer else {
-                    completion.resume(returning: nil)
-                    return
-                }
-                completion.resume(returning: sb)
-            }
-            if status != noErr {
-                completion.resume(returning: nil)
-            }
+    ) -> EncodeCompletion {
+        let completion = EncodeCompletion()
+        let timeout = DispatchWorkItem {
+            streamDiagnosticLog("[stream:h264] encode timed out")
+            completion.resume(returning: nil)
         }
+        completion.setTimeout(timeout)
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(
+            deadline: .now() + Self.encodeTimeout,
+            execute: timeout
+        )
+        let status = VTCompressionSessionEncodeFrame(
+            session,
+            imageBuffer: source,
+            presentationTimeStamp: presentationTimeStamp,
+            duration: .invalid,
+            frameProperties: frameProperties,
+            infoFlagsOut: nil
+        ) { @Sendable status, _, sampleBuffer in
+            guard status == noErr, let sb = sampleBuffer else {
+                completion.resume(returning: nil)
+                return
+            }
+            completion.resume(returning: sb)
+        }
+        if status != noErr {
+            completion.resume(returning: nil)
+        }
+        return completion
     }
 
     func update(fps nextFps: Int, bitrate nextBitrate: Int) {
         let normalizedFps = Int32(max(1, nextFps))
         let normalizedBitrate = max(1, nextBitrate)
-        if encodeInFlight {
+        if encodesInFlight > 0 {
             pendingSettings = (normalizedFps, normalizedBitrate)
             return
         }
@@ -326,13 +354,27 @@ actor H264Encoder {
     }
 }
 
+/// One frame's VideoToolbox result. The sample may arrive before or after someone
+/// awaits `value()`; the first `resume` wins and later ones are ignored.
 private final class EncodeCompletion: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<CMSampleBuffer?, Never>?
     private var timeout: DispatchWorkItem?
+    private var finished = false
+    private var result: CMSampleBuffer?
 
-    init(_ continuation: CheckedContinuation<CMSampleBuffer?, Never>) {
-        self.continuation = continuation
+    func value() async -> CMSampleBuffer? {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if finished {
+                let result = self.result
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
     }
 
     func setTimeout(_ timeout: DispatchWorkItem) {
@@ -343,6 +385,12 @@ private final class EncodeCompletion: @unchecked Sendable {
 
     func resume(returning sampleBuffer: CMSampleBuffer?) {
         lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        result = sampleBuffer
         let continuation = self.continuation
         self.continuation = nil
         let timeout = self.timeout
